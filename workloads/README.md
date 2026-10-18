@@ -1,7 +1,7 @@
 # Workload definitions
 
 `translate-segment.yaml` routes one bounded text segment to a pinned local
-CUDA LibreTranslate service (capability `libretranslate`). Each worker host
+LibreTranslate service (capability `libretranslate`). Each worker host
 runs its own loopback-only service on `127.0.0.1:5001` and advertises the
 capability plus the `libretranslate-1.9.6-bounded-sbd` model pack; any number
 of heterogeneous workers may serve the same route concurrently. Reviewed 8 GB
@@ -20,6 +20,48 @@ an ordered same-language `segments` array and amortizes claims, HTTP setup,
 artifacts, and state transitions. It remains model-server agnostic and contains
 no producer-specific identifiers. `translate-batch.yaml` is the separate
 true CTranslate2/Argos token-batching contract for audited model-pack workers.
+
+## CPU route
+
+`translate-segment.yaml` also defines `libretranslate-cpu`: the same executor,
+contract, and loopback endpoint as `libretranslate-v1`, but pinned to a CPU
+slot (`vendor: cpu`, capability `libretranslate-cpu`, no model pack). Jobs opt
+in by submitting with `"route": "libretranslate-cpu"`; the default route
+stays on GPU, and the autoscaler never provisions for the CPU route — it is
+served by volunteer or self-managed workers.
+
+A CPU-only host serves it through `sparehour-worker`, which registers CPU
+slots (`vendor: cpu`) after `sparehour-worker login`:
+
+```sh
+sparehour-worker select libretranslate-cpu
+sparehour-worker run --cpu-slots 1
+```
+
+CPU slots are off by default (`cpu_slots: 0`); `--cpu-slots` overrides the
+count for one run, or set it permanently with
+`sparehour-worker config set cpu_slots=1`. The plain `sparehour agent`
+command discovers NVIDIA slots only (real ones via `nvidia-smi`, or
+`--fake-gpus`), so it cannot register the CPU slots this route requires; on
+a GPU host it serves the default route as shown above with
+`--capability libretranslate`.
+
+Start the loopback service with float32 inference:
+
+```sh
+ARGOS_COMPUTE_TYPE=float32 libretranslate --host 127.0.0.1 --port 5001 \
+  --load-only en,de
+```
+
+`ARGOS_COMPUTE_TYPE=float32` is required, not a tuning knob: in testing, CPU
+int8 inference (the default `auto` compute type) in the same process as
+onnxruntime was nondeterministic and occasionally returned degenerate output —
+a short sentence decoded into hundreds of repeated tokens. The executor
+screens every response, re-requests it once, and then fails the job with a
+retryable `degenerate_output` error; it never writes the bad text as an
+artifact. A pair the service has not loaded fails that one job with
+`unsupported_language_pair` — the service itself stays healthy and keeps
+serving the pairs it did load.
 
 `image-generate.yaml` (v3) routes to the bundled fixed SDXL Diffusers
 plugin. A worker must install the pinned Diffusers runtime and provision

@@ -2,13 +2,16 @@ api_version: sparehour.example/v1alpha1
 name: translate-segment
 version: "1"
 description: >
-  One bounded text segment translated by a pinned local CUDA LibreTranslate
+  One bounded text segment translated by a pinned local LibreTranslate
   service. A job selects only its text and a schema-bounded source/target
   language pair from the set the service loads; the endpoint, wire format,
   and response bound are fixed by this trusted route. Any number of worker
   hosts can serve this capability, each with its own loopback model service.
-  For bulk throughput prefer the offline translate-batch workload, which
-  amortizes queue overhead across many segments per job.
+  The default route libretranslate-v1 requires an NVIDIA GPU; the
+  libretranslate-cpu route serves the same contract on CPU-only volunteer
+  workers with a loopback service pinned to float32 inference. For bulk
+  throughput prefer the offline translate-batch workload, which amortizes
+  queue overhead across many segments per job.
 default_route: libretranslate-v1
 payload_schema:
   $schema: https://json-schema.org/draft/2020-12/schema
@@ -82,6 +85,45 @@ routes:
       target_completion_hours: 2
       startup_minutes: 20
       scale_down_idle_minutes: 10
+  libretranslate-cpu:
+    compatibility:
+      capability: libretranslate-cpu
+      # No reviewed pack: the operator installs and pins the LibreTranslate
+      # service themselves; the executor only probes and screens it.
+      model_packs: []
+    resources:
+      # The contract still reserves one slot per job; on this route the slot
+      # is a CPU execution slot, not a GPU.
+      gpu_count: 1
+      vendor: cpu
+      min_vram_mb: 0
+      min_cpu_cores: 2
+      min_ram_mb: 4096
+      min_disk_mb: 8192
+    executor:
+      type: plugin
+      handler: sparehour_workloads.libretranslate:LibreTranslateExecutor
+      timeout_seconds: 180
+      environment:
+        # Loopback-only model service co-located with the worker; it MUST be
+        # started with ARGOS_COMPUTE_TYPE=float32 (see workloads/README.md):
+        # CPU int8 inference in this setup was nondeterministic and sometimes
+        # returned degenerate output.
+        LIBRETRANSLATE_ENDPOINT: http://127.0.0.1:5001/translate
+        LIBRETRANSLATE_FORMAT: text
+    cost:
+      unit: segment
+      default_units_per_job: 1
+      # Conservative prior for short segments on CPU (about one segment per
+      # two seconds); replace with measured segments/hour per CPU class
+      # before trusting any economics derived from it.
+      default_units_per_gpu_hour: 1800
+    scaling:
+      # CPU routes are served by volunteer/self-managed workers; the
+      # autoscaler never provisions for them.
+      enabled: false
+      min_slots: 0
+      max_slots: 4
 retry:
   max_attempts: 3
   retryable_error_codes:
@@ -91,3 +133,4 @@ retry:
     - gpu_oom
     - model_server_unavailable
     - model_server_error
+    - degenerate_output
