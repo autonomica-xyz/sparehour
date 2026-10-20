@@ -37,12 +37,12 @@ dependencies = [
 
 [project.optional-dependencies]
 models = [
-  "huggingface-hub>=0.36,<2",
+  "huggingface-hub>=0.36,<3",
 ]
 dev = [
   "pytest>=9.0.3,<10",
   "pytest-cov>=5,<8",
-  "huggingface-hub>=0.36,<2",
+  "huggingface-hub>=0.36,<3",
 ]
 
 [project.urls]
