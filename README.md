@@ -87,6 +87,22 @@ and [vLLM](deploy/llm/requirements.txt) runtime profiles. Bundled ML routes
 target NVIDIA hardware. Model licenses apply separately; a fresh pyannote
 diarization-pack download requires approved Hugging Face access.
 
+### Spark and architecture-specific placement
+
+Both `sparehour agent` and the companion worker advertise hardware-derived
+`arch` labels (`arm64` / `amd64`, otherwise the lower-case machine name).
+Set `resources.required_labels: {arch: arm64}` on ARM-only routes and
+`{arch: amd64}` on x86-only routes; unlabelled routes remain architecture-neutral.
+This is placement, not automatic runtime or container-platform validation.
+
+Integrated NVIDIA devices with unavailable `nvidia-smi` memory are verified
+through CUDA by UUID and tagged `memory=unified`. Their advertised capacity
+is conservatively bounded by device memory and Linux `MemAvailable`, excluding
+swap and leaving 20% headroom; it is not dedicated VRAM or an enforced limit.
+The companion worker additionally applies cgroup limits and partitions this
+shared budget with CPU slots. Use it for mixed CPU/GPU operation on Spark.
+Operator `arch` and `memory` labels cannot override these hardware facts.
+
 ## Install
 
 Python 3.10 or newer is required. Install from these repositories or a

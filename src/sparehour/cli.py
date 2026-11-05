@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import platform
 import shutil
 import socket
 import sys
@@ -251,7 +252,7 @@ def cmd_agent_run(args: argparse.Namespace) -> int:
         cpu_cores=float(os.cpu_count() or 0),
         ram_mb=_system_ram_mb(),
         disk_free_mb=disk.free // (1024 * 1024),
-        labels=_key_values(args.label),
+        labels=_arch_labels(_key_values(args.label)),
         slots=slots,
     )
     client = ControlPlaneClient(args.endpoint, token)
@@ -286,7 +287,7 @@ def _agent_slots(args: argparse.Namespace) -> list[SlotInventory]:
                 compute_capability=args.fake_compute_capability,
                 capabilities=capabilities,
                 model_packs=args.model_pack,
-                labels=_key_values(args.slot_label),
+                labels=_arch_labels(_key_values(args.slot_label)),
             )
             for index in range(args.fake_gpus)
         ]
@@ -294,7 +295,7 @@ def _agent_slots(args: argparse.Namespace) -> list[SlotInventory]:
         args.agent_id,
         capabilities=capabilities,
         model_packs=args.model_pack,
-        labels=_key_values(args.slot_label),
+        labels=_arch_labels(_key_values(args.slot_label)),
     )
 
 
@@ -306,6 +307,23 @@ def _key_values(values: list[str]) -> dict[str, str]:
             raise ValueError(f"expected KEY=VALUE, got {raw!r}")
         result[key] = value
     return result
+
+
+_ARCH_ALIASES = {"aarch64": "arm64", "arm64": "arm64", "x86_64": "amd64", "amd64": "amd64"}
+
+
+def _arch_labels(labels: dict[str, str]) -> dict[str, str]:
+    """Advertise the hardware arch as a label; it wins over operator values.
+
+    The operator ``memory`` tag is stripped: UMA is a hardware fact owned by
+    slot discovery, not a spoofable operator label.
+    """
+    machine = platform.machine().strip().casefold()
+    arch = _ARCH_ALIASES.get(machine, machine)
+    return {
+        **{key: value for key, value in labels.items() if key != "memory"},
+        "arch": arch,
+    }
 
 
 def _secret_value(explicit: str | None, file_path: str | None, env_name: str) -> str:

@@ -8,6 +8,7 @@ without requiring the jobs themselves to know about distributed execution.
 from __future__ import annotations
 
 import copy
+import ctypes
 import hashlib
 import importlib
 import json
@@ -44,6 +45,99 @@ class ExecutionError(AgentError):
 # path construction safe even against a corrupt job document.
 _INPUT_NAME_RE = re.compile(r"^[a-z][a-z0-9_.-]{0,62}$")
 
+# Unavailable-memory markers nvidia-smi prints when a field cannot be read.
+_UNAVAILABLE_MEMORY_MARKERS = frozenset(
+    {"[n/a]", "[not supported]", "[insufficient permissions]"}
+)
+# CU_DEVICE_ATTRIBUTE_INTEGRATED: nonzero when the CUDA device draws memory
+# from the host's unified DRAM pool (e.g. Grace-Blackwell GB10) instead of
+# dedicated VRAM, which is why nvidia-smi cannot report a memory.total.
+_CU_DEVICE_ATTRIBUTE_INTEGRATED = 18
+_MIB = 1024 * 1024
+
+
+class _CUuuid(ctypes.Structure):
+    _fields_ = [("bytes", ctypes.c_ubyte * 16)]
+
+
+def _load_libcuda() -> ctypes.CDLL:
+    names = ("nvcuda.dll",) if sys.platform == "win32" else ("libcuda.so.1", "libcuda.so")
+    for name in names:
+        try:
+            return ctypes.CDLL(name)
+        except OSError:
+            continue
+    raise AgentError(
+        "CUDA driver library not loadable; cannot probe unified-memory GPUs"
+    )
+
+
+def _cu_check(rc: int, what: str) -> None:
+    if rc != 0:
+        raise AgentError(f"CUDA driver query {what} failed with error {rc}")
+
+
+def _format_cu_uuid(uuid: _CUuuid) -> str:
+    hexdigest = bytes(uuid.bytes).hex()
+    return (
+        f"gpu-{hexdigest[0:8]}-{hexdigest[8:12]}-{hexdigest[12:16]}-"
+        f"{hexdigest[16:20]}-{hexdigest[20:32]}"
+    )
+
+
+def _cuda_device_table(lib: ctypes.CDLL | None = None) -> dict[str, tuple[bool, int]]:
+    """Lowercase "gpu-..." UUID -> (integrated, total memory bytes), all CUDA-visible devices.
+
+    Device-level driver queries only (cuInit/cuDeviceGet*); no CUDA context is
+    created, so probing neither allocates GPU memory nor disturbs running jobs.
+    Visibility follows CUDA_VISIBLE_DEVICES, which is why nvidia-smi rows are
+    matched by UUID here, never by ordinal.
+    """
+    if lib is None:
+        lib = _load_libcuda()
+    _cu_check(lib.cuInit(0), "cuInit")
+    count = ctypes.c_int(0)
+    _cu_check(lib.cuDeviceGetCount(ctypes.byref(count)), "cuDeviceGetCount")
+    get_uuid = getattr(lib, "cuDeviceGetUuid_v2", None) or lib.cuDeviceGetUuid
+    table: dict[str, tuple[bool, int]] = {}
+    for ordinal in range(count.value):
+        dev = ctypes.c_int(0)
+        _cu_check(lib.cuDeviceGet(ctypes.byref(dev), ordinal), "cuDeviceGet")
+        uuid = _CUuuid()
+        _cu_check(get_uuid(ctypes.byref(uuid), dev), "cuDeviceGetUuid")
+        integrated = ctypes.c_int(0)
+        _cu_check(
+            lib.cuDeviceGetAttribute(
+                ctypes.byref(integrated), _CU_DEVICE_ATTRIBUTE_INTEGRATED, dev
+            ),
+            "cuDeviceGetAttribute(INTEGRATED)",
+        )
+        total = ctypes.c_size_t(0)
+        _cu_check(lib.cuDeviceTotalMem_v2(ctypes.byref(total), dev), "cuDeviceTotalMem")
+        table[_format_cu_uuid(uuid)] = (bool(integrated.value), int(total.value))
+    return table
+
+
+def _mem_available_bytes() -> int:
+    """Current MemAvailable in bytes; AgentError when unreadable (fail closed).
+
+    Only consulted on the unified-memory discovery path where the budget must
+    reflect real host memory; MemAvailable excludes swap by definition.
+    """
+    try:
+        for line in Path("/proc/meminfo").read_text(encoding="utf-8").splitlines():
+            if line.startswith("MemAvailable:"):
+                kb = int(line.split()[1])
+                if kb > 0:
+                    return kb * 1024
+                break
+    except (OSError, ValueError, IndexError):
+        pass
+    raise AgentError(
+        "cannot read MemAvailable from /proc/meminfo; cannot budget unified-memory GPUs"
+    )
+
+
 def discover_nvidia_slots(
     agent_id: str,
     *,
@@ -61,7 +155,13 @@ def discover_nvidia_slots(
         result = runner(command, text=True, capture_output=True, check=True, timeout=15)
     except (OSError, subprocess.SubprocessError) as exc:
         raise AgentError(f"could not discover NVIDIA GPUs with nvidia-smi: {exc}") from exc
-    slots = []
+    # The `memory` label is hardware-owned: only slots whose integrated status
+    # was verified by the CUDA probe carry memory=unified, so operator labels
+    # can never spoof unified-memory accounting on discrete GPUs.
+    base_labels = dict(labels or {})
+    base_labels.pop("memory", None)
+    slots: list[SlotInventory] = []
+    uma_rows: list[tuple[int, str, str, str]] = []
     for line in result.stdout.splitlines():
         if not line.strip():
             continue
@@ -69,21 +169,109 @@ def discover_nvidia_slots(
         if len(parts) != 5:
             raise AgentError(f"unexpected nvidia-smi row: {line!r}")
         index, gpu_uuid, model, vram_mb, compute_capability = parts
+        if vram_mb.lower() in _UNAVAILABLE_MEMORY_MARKERS:
+            uma_rows.append((int(index), gpu_uuid, model, compute_capability))
+            continue
+        try:
+            vram = int(float(vram_mb))
+        except ValueError:
+            raise AgentError(
+                f"invalid nvidia-smi memory.total {vram_mb!r} in row: {line!r}"
+            ) from None
+        if vram <= 0:
+            raise AgentError(
+                f"invalid nvidia-smi memory.total {vram_mb!r} in row: {line!r}"
+            )
         slots.append(
             SlotInventory(
                 id=f"{agent_id}-gpu-{int(index)}",
                 gpu_index=int(index),
                 gpu_uuid=gpu_uuid,
                 model=model,
-                vram_mb=int(float(vram_mb)),
+                vram_mb=vram,
                 compute_capability=compute_capability,
                 capabilities=list(capabilities),
                 model_packs=list(model_packs),
-                labels=labels or {},
+                labels=dict(base_labels),
+            )
+        )
+    if uma_rows:
+        slots.extend(
+            _unified_memory_slots(
+                agent_id,
+                uma_rows,
+                base_labels,
+                capabilities=capabilities,
+                model_packs=model_packs,
             )
         )
     if not slots:
         raise AgentError("nvidia-smi returned no GPUs")
+    return slots
+
+
+def _unified_memory_slots(
+    agent_id: str,
+    rows: Sequence[tuple[int, str, str, str]],
+    base_labels: dict[str, str],
+    *,
+    capabilities: Sequence[str],
+    model_packs: Sequence[str],
+) -> list[SlotInventory]:
+    """Slots for integrated (unified-memory) GPUs, failing closed.
+
+    nvidia-smi cannot report memory.total for integrated devices, so the CUDA
+    driver (device-level queries, no context) verifies the device really is
+    integrated and how much of the shared DRAM pool it sees, matched by UUID
+    because CUDA ordinals diverge from nvidia-smi indices under
+    CUDA_VISIBLE_DEVICES. Slot budget = min(80% of the device's total, 80% of
+    MemAvailable) divided by the number of integrated devices, since they all
+    draw from one physical pool and must not count it multiple times.
+    """
+    table = _cuda_device_table()
+    probes: list[tuple[int, str, str, str, int]] = []
+    for index, gpu_uuid, model, compute_capability in rows:
+        probe = table.get(gpu_uuid.lower())
+        if probe is None:
+            raise AgentError(
+                f"CUDA cannot see GPU {gpu_uuid} (hidden by CUDA_VISIBLE_DEVICES "
+                "or unrecognized UUID); cannot establish its memory budget"
+            )
+        integrated, total = probe
+        if not integrated:
+            raise AgentError(
+                f"GPU {gpu_uuid} reports unavailable nvidia-smi memory but is not "
+                "an integrated device; refusing to guess its memory"
+            )
+        if total <= 0:
+            raise AgentError(f"CUDA reports no total memory for GPU {gpu_uuid}")
+        probes.append((index, gpu_uuid, model, compute_capability, total))
+    pool_bytes = min(
+        int(0.8 * max(total for *_, total in probes)),
+        int(0.8 * _mem_available_bytes()),
+    )
+    per_slot_bytes = pool_bytes // len(probes)
+    slots = []
+    for index, gpu_uuid, model, compute_capability, total in probes:
+        vram_mb = min(int(0.8 * total), per_slot_bytes) // _MIB
+        if vram_mb <= 0:
+            raise AgentError(
+                f"unified-memory budget for GPU {gpu_uuid} is below 1 MiB; "
+                "refusing to advertise an unusable slot"
+            )
+        slots.append(
+            SlotInventory(
+                id=f"{agent_id}-gpu-{index}",
+                gpu_index=index,
+                gpu_uuid=gpu_uuid,
+                model=model,
+                vram_mb=vram_mb,
+                compute_capability=compute_capability,
+                capabilities=list(capabilities),
+                model_packs=list(model_packs),
+                labels={**base_labels, "memory": "unified"},
+            )
+        )
     return slots
 
 

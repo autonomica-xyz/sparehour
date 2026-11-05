@@ -222,3 +222,177 @@ def test_command_executor_uses_the_agent_python(tmp_path):
     assert outputs[0]["name"] == "result"
     result_path = tmp_path / "result.json"
     assert json.loads(result_path.read_text(encoding="utf-8"))["message"] == "hello"
+
+
+# -- unified-memory (integrated GPU) discovery -------------------------------
+
+_GIB = 1024 * 1024 * 1024
+
+
+def _nvidia_runner(stdout: str):
+    def runner(*_args, **_kwargs):
+        return subprocess.CompletedProcess([], 0, stdout=stdout, stderr="")
+
+    return runner
+
+
+def test_uma_na_memory_becomes_budgeted_unified_slot(monkeypatch):
+    monkeypatch.setattr(
+        "sparehour.agent._cuda_device_table",
+        lambda: {"gpu-abc": (True, 128 * _GIB)},
+    )
+    monkeypatch.setattr(
+        "sparehour.agent._mem_available_bytes", lambda: 120 * _GIB
+    )
+
+    slots = discover_nvidia_slots(
+        "spark",
+        capabilities=["llm"],
+        model_packs=[],
+        runner=_nvidia_runner("0, GPU-ABC, NVIDIA GB10, [N/A], 12.1\n"),
+    )
+
+    assert len(slots) == 1
+    slot = slots[0]
+    # Budget = min(80% of device total, 80% of MemAvailable) in MiB.
+    assert slot.vram_mb == int(0.8 * 120 * _GIB) // (1024 * 1024)
+    assert slot.vram_mb < int(0.8 * 128 * _GIB) // (1024 * 1024)
+    assert slot.labels["memory"] == "unified"
+    assert slot.gpu_index == 0
+    assert slot.compute_capability == "12.1"
+
+
+def test_uma_slots_bind_by_uuid_not_ordinal(monkeypatch):
+    monkeypatch.setattr(
+        "sparehour.agent._cuda_device_table",
+        lambda: {"gpu-a": (True, 120 * _GIB), "gpu-b": (True, 120 * _GIB)},
+    )
+    monkeypatch.setattr(
+        "sparehour.agent._mem_available_bytes", lambda: 120 * _GIB
+    )
+    # CUDA-visible order is irrelevant; nvidia-smi index/UUID bind the slot.
+    stdout = "0, GPU-b, NVIDIA GB10, [N/A], 12.1\n1, GPU-a, NVIDIA GB10, [N/A], 12.1\n"
+
+    slots = discover_nvidia_slots(
+        "spark",
+        capabilities=[],
+        model_packs=[],
+        runner=_nvidia_runner(stdout),
+    )
+
+    assert [slot.id for slot in slots] == ["spark-gpu-0", "spark-gpu-1"]
+    assert [slot.gpu_uuid for slot in slots] == ["GPU-b", "GPU-a"]
+    # Two integrated devices share one pool: the budget is divided, not doubled.
+    expected = int(0.8 * 120 * _GIB) // 2 // (1024 * 1024)
+    assert all(slot.vram_mb == expected for slot in slots)
+    assert all(slot.labels["memory"] == "unified" for slot in slots)
+
+
+def test_uma_uuid_hidden_from_cuda_is_rejected(monkeypatch):
+    monkeypatch.setattr(
+        "sparehour.agent._cuda_device_table", lambda: {"gpu-a": (True, 8 * _GIB)}
+    )
+    monkeypatch.setattr("sparehour.agent._mem_available_bytes", lambda: 8 * _GIB)
+
+    with pytest.raises(AgentError, match="cannot see GPU GPU-hddn"):
+        discover_nvidia_slots(
+            "spark",
+            capabilities=[],
+            model_packs=[],
+            runner=_nvidia_runner("0, GPU-hddn, NVIDIA GB10, [N/A], 12.1\n"),
+        )
+
+
+def test_na_memory_on_non_integrated_device_is_rejected(monkeypatch):
+    monkeypatch.setattr(
+        "sparehour.agent._cuda_device_table", lambda: {"gpu-a": (False, 24 * _GIB)}
+    )
+    monkeypatch.setattr("sparehour.agent._mem_available_bytes", lambda: 32 * _GIB)
+
+    with pytest.raises(AgentError, match="not an integrated"):
+        discover_nvidia_slots(
+            "tower",
+            capabilities=[],
+            model_packs=[],
+            runner=_nvidia_runner("0, GPU-a, RTX 4090, [Not Supported], 8.9\n"),
+        )
+
+
+@pytest.mark.parametrize("vram", ["oops", "-5"])
+def test_invalid_discrete_memory_is_rejected(monkeypatch, vram):
+    def runner(*_args, **_kwargs):
+        return subprocess.CompletedProcess(
+            [], 0, stdout=f"0, GPU-a, RTX 4090, {vram}, 8.9\n", stderr=""
+        )
+
+    with pytest.raises(AgentError, match="invalid nvidia-smi memory.total"):
+        discover_nvidia_slots(
+            "tower", capabilities=[], model_packs=[], runner=runner
+        )
+
+
+def test_low_mem_available_fails_closed_on_uma_path(monkeypatch):
+    monkeypatch.setattr(
+        "sparehour.agent._cuda_device_table", lambda: {"gpu-a": (True, 128 * _GIB)}
+    )
+    monkeypatch.setattr("sparehour.agent._mem_available_bytes", lambda: 512 * 1024)
+
+    with pytest.raises(AgentError, match="below 1 MiB"):
+        discover_nvidia_slots(
+            "spark",
+            capabilities=[],
+            model_packs=[],
+            runner=_nvidia_runner("0, GPU-a, NVIDIA GB10, [N/A], 12.1\n"),
+        )
+
+
+def test_unreadable_mem_available_fails_closed_on_uma_path(monkeypatch):
+    monkeypatch.setattr(
+        "sparehour.agent._cuda_device_table", lambda: {"gpu-a": (True, 128 * _GIB)}
+    )
+
+    class BrokenPath:
+        def read_text(self, *_args, **_kwargs):
+            raise OSError("no meminfo")
+
+    monkeypatch.setattr("sparehour.agent.Path", lambda _p: BrokenPath())
+
+    with pytest.raises(AgentError, match="MemAvailable"):
+        discover_nvidia_slots(
+            "spark",
+            capabilities=[],
+            model_packs=[],
+            runner=_nvidia_runner("0, GPU-a, NVIDIA GB10, [N/A], 12.1\n"),
+        )
+
+
+def test_operator_memory_label_is_stripped_on_discrete_slots():
+    def runner(*_args, **_kwargs):
+        return subprocess.CompletedProcess(
+            [], 0, stdout="0, GPU-a, RTX 4090, 24564, 8.9\n", stderr=""
+        )
+
+    slots = discover_nvidia_slots(
+        "tower",
+        capabilities=[],
+        model_packs=[],
+        labels={"memory": "unified", "team": "x"},
+        runner=runner,
+    )
+
+    assert slots[0].labels == {"team": "x"}
+
+
+def test_cuda_driver_failure_fails_closed_on_uma_path(monkeypatch):
+    def broken_table():
+        raise AgentError("CUDA driver query cuInit failed with error 999")
+
+    monkeypatch.setattr("sparehour.agent._cuda_device_table", broken_table)
+
+    with pytest.raises(AgentError, match="cuInit"):
+        discover_nvidia_slots(
+            "spark",
+            capabilities=[],
+            model_packs=[],
+            runner=_nvidia_runner("0, GPU-a, NVIDIA GB10, [N/A], 12.1\n"),
+        )
