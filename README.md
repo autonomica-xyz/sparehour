@@ -105,7 +105,7 @@ Operator `arch` and `memory` labels cannot override these hardware facts.
 
 ## Install
 
-Python 3.10 or newer is required. Install from these repositories or a
+Python 3.11 or newer is required. Install from these repositories or a
 locally built wheel:
 
 ```bash

@@ -5,7 +5,7 @@ development environment, run tests, and prepare changes for review.
 
 ## Development setup
 
-The project uses Python 3.10 or newer and a virtual environment:
+The project uses Python 3.11 or newer and a virtual environment:
 
 ```bash
 python3 -m venv .venv
