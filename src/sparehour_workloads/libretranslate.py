@@ -1,4 +1,4 @@
-"""Fixed adapter for a local CUDA LibreTranslate service.
+"""Fixed adapter for a local CUDA or CPU LibreTranslate service.
 
 Jobs provide one bounded text segment plus a schema-bounded source and target
 language from the set the pinned service loads. The trusted route fixes the
@@ -8,8 +8,17 @@ job never selects the model server, an API key, or any execution code.
 Before the first translation on an endpoint the adapter probes the service's
 ``/languages`` listing and requires the requested pair to be loaded, so the
 slot only serves jobs while the correct pinned models are actually resident.
-All response reads are bounded: error bodies are capped and sanitized before
-they are embedded in an ``ExecutionError``.
+A reachable, healthy service that simply has not loaded the requested pair
+fails that one job with ``unsupported_language_pair``; only an unreachable or
+broken service reports ``model_server_unavailable`` / ``model_server_error``.
+
+The service exposes no generation parameters, so the adapter also screens
+every response with a cheap sanity check: LibreTranslate's CPU int8 path
+occasionally decodes a short source into thousands of repeats of one token.
+Degenerate output is re-requested once and then fails the job with
+``degenerate_output``; it is never written as an artifact. All response reads
+are bounded: error bodies are capped and sanitized before they are embedded
+in an ``ExecutionError``.
 """
 
 from __future__ import annotations
@@ -38,6 +47,20 @@ MAX_BATCH_SEGMENTS = 64
 MAX_BATCH_CHARACTERS = 256_000
 MAX_READY_ENDPOINTS = 8
 PROBE_TIMEOUT_SECONDS = 15.0
+
+# Degenerate-output screens. LibreTranslate's HTTP API exposes no max-length
+# or repetition controls, so the executor validates responses itself.
+LENGTH_RATIO = 5
+LENGTH_SLACK = 64
+REPEAT_RUN = 6
+MIN_DISTINCT_TOKENS = 24
+LOW_DISTINCT_RATIO = 0.2
+SOURCE_DISTINCT_RATIO = 0.5
+# Text with at least this many characters and fewer than one space per
+# SPACE_DENSITY characters (CJK, Thai, ...) is tokenized per character.
+CHAR_TOKEN_MIN_CHARS = 40
+SPACE_DENSITY = 20
+MAX_NGRAM = 4
 
 _CONTROL_CHARS = re.compile(r"[^\x20-\x7e\r\n\t]")
 
@@ -126,8 +149,12 @@ def _ensure_ready(
             continue
         loaded_targets.update(str(item) for item in entry["targets"])
     if target not in loaded_targets:
+        # The service is up and healthy; this particular job asked for a pair
+        # it never loaded. That is a job-level failure: "model_load_failed"
+        # drains the whole worker (sparehour.agent.DRAINING_EXECUTION_ERRORS),
+        # and one bad job must not stop the slot from serving loaded pairs.
         raise ExecutionError(
-            "model_load_failed",
+            "unsupported_language_pair",
             f"LibreTranslate has no loaded model for {source!r} -> {target!r}",
         )
     with _READY_LOCK:
@@ -145,6 +172,7 @@ def _translate(
     target: str,
     texts: str | list[str],
     timeout: float,
+    alternatives: int = 0,
 ) -> str | list[str]:
     _ensure_ready(
         languages_url=_languages_url(endpoint), source=source, target=target
@@ -155,6 +183,8 @@ def _translate(
         "target": target,
         "format": request_format,
     }
+    if alternatives:
+        request_body["alternatives"] = alternatives
     try:
         with httpx.stream(
             "POST", endpoint, json=request_body, timeout=timeout, trust_env=False
@@ -183,6 +213,110 @@ def _translate(
         ) from exc
 
 
+def _tokenize(text: str) -> list[str]:
+    """Whitespace tokens, or per-character tokens for unspaced CJK/Thai."""
+    if (
+        len(text) >= CHAR_TOKEN_MIN_CHARS
+        and text.count(" ") * SPACE_DENSITY < len(text)
+    ):
+        return list(text)
+    return text.split()
+
+
+def _longest_repeat_run(tokens: list[str]) -> int:
+    """Longest run of one n-gram (n <= MAX_NGRAM) repeated back-to-back.
+
+    Linear in the token count: for each width the run ending at each token
+    either starts fresh or extends the run one period back.
+    """
+    best = 0
+    for width in range(1, MAX_NGRAM + 1):
+        if len(tokens) < width:
+            break
+        runs = [1] * len(tokens)
+        for index in range(width, len(tokens)):
+            if tokens[index : index + width] == tokens[index - width : index]:
+                runs[index] = runs[index - width] + 1
+                if runs[index] > best:
+                    best = runs[index]
+    return best
+
+
+def _distinct_ratio(tokens: list[str]) -> float:
+    """Distinct-token ratio; 1.0 for empty input so it never looks cyclic."""
+    if not tokens:
+        return 1.0
+    return len(set(tokens)) / len(tokens)
+
+
+def _degenerate_reason(source: str, translated: str) -> str | None:
+    """Return a short human reason when a translation fails the sanity check.
+
+    Screens the response of a service that exposes no generation controls.
+    Both rules compare against the same metric on the source text, so prose
+    that is legitimately repetitive (or legitimately longer) passes: normal
+    translations, including zh/ja -> en character expansion, stay clean.
+    """
+    if len(translated) > LENGTH_RATIO * len(source) + LENGTH_SLACK:
+        return (
+            f"translated length {len(translated)} exceeds "
+            f"{LENGTH_RATIO}x the {len(source)}-character source"
+        )
+
+    output_tokens = _tokenize(translated)
+    output_run = _longest_repeat_run(output_tokens)
+    if output_run >= REPEAT_RUN:
+        source_run = _longest_repeat_run(_tokenize(source))
+        if output_run > 2 * source_run:
+            return f"an n-gram repeats {output_run} times in a row"
+
+    if len(output_tokens) >= MIN_DISTINCT_TOKENS:
+        output_ratio = _distinct_ratio(output_tokens)
+        if output_ratio < LOW_DISTINCT_RATIO:
+            source_tokens = _tokenize(source)
+            if _distinct_ratio(source_tokens) >= SOURCE_DISTINCT_RATIO:
+                return (
+                    f"only {len(set(output_tokens))} distinct tokens "
+                    f"in {len(output_tokens)}"
+                )
+    return None
+
+
+def _first_degenerate_segment(
+    sources: list[str],
+    translations: list[str],
+) -> tuple[int, str] | None:
+    """Index and reason of the first degenerate segment, else None."""
+    for index, (source, translated) in enumerate(zip(sources, translations)):
+        reason = _degenerate_reason(source, translated)
+        if reason is not None:
+            return index, reason
+    return None
+
+
+def _retranslate(request: dict[str, Any]) -> str | list[str]:
+    """Re-request a translation that failed the sanity check.
+
+    Argos Translate keeps the previous request's paragraphs in a per-pair
+    cache, so repeating the identical request returns the same degenerate
+    text. Asking for one alternative changes the hypothesis count, which
+    misses that cache and forces a fresh decode; ``translatedText`` is still
+    the best hypothesis. A service configured to refuse alternatives makes
+    the retry fail as ``degenerate_output`` rather than a misleading
+    ``translation_rejected``.
+    """
+    try:
+        return _translate(**request, alternatives=1)
+    except ExecutionError as exc:
+        if exc.code != "translation_rejected":
+            raise
+        raise ExecutionError(
+            "degenerate_output",
+            f"LibreTranslate output failed sanity check and the retry was "
+            f"rejected: {exc}",
+        ) from exc
+
+
 class LibreTranslateExecutor:
     def execute(
         self,
@@ -195,20 +329,37 @@ class LibreTranslateExecutor:
         # GPU for this route; the slot merely gates concurrent claim capacity.
         payload = job["payload"]
         environment = job["executor"].get("environment") or {}
-        endpoint = environment.get("LIBRETRANSLATE_ENDPOINT", DEFAULT_ENDPOINT)
-        request_format = environment.get("LIBRETRANSLATE_FORMAT", DEFAULT_FORMAT)
-        translated = _translate(
-            endpoint=endpoint,
-            request_format=request_format,
-            source=str(payload["source"]),
-            target=str(payload["target"]),
-            texts=str(payload["text"]),
-            timeout=float(job["executor"].get("timeout_seconds") or 180),
-        )
+        request = {
+            "endpoint": environment.get("LIBRETRANSLATE_ENDPOINT", DEFAULT_ENDPOINT),
+            "request_format": environment.get("LIBRETRANSLATE_FORMAT", DEFAULT_FORMAT),
+            "source": str(payload["source"]),
+            "target": str(payload["target"]),
+            "texts": str(payload["text"]),
+            "timeout": float(job["executor"].get("timeout_seconds") or 180),
+        }
+        translated = _translate(**request)
         if not isinstance(translated, str):
             raise ExecutionError(
                 "model_server_error", "translatedText is not a single text segment"
             )
+
+        reason = _degenerate_reason(str(payload["text"]), translated)
+        if reason is not None:
+            # Degenerate decodes are nondeterministic, so one re-request
+            # usually returns sane text; the readiness probe is cached and
+            # this costs a single extra POST. The bad output is never written.
+            translated = _retranslate(request)
+            if not isinstance(translated, str):
+                raise ExecutionError(
+                    "model_server_error",
+                    "translatedText is not a single text segment",
+                )
+            reason = _degenerate_reason(str(payload["text"]), translated)
+            if reason is not None:
+                raise ExecutionError(
+                    "degenerate_output",
+                    f"LibreTranslate output failed sanity check: {reason}",
+                )
 
         output = workdir / "translation.txt"
         output.write_text(translated, encoding="utf-8")
@@ -247,24 +398,41 @@ class LibreTranslateBatchExecutor:
 
         environment = job["executor"].get("environment") or {}
         started = time.monotonic()
-        translated = _translate(
-            endpoint=environment.get("LIBRETRANSLATE_ENDPOINT", DEFAULT_ENDPOINT),
-            request_format=environment.get("LIBRETRANSLATE_FORMAT", DEFAULT_FORMAT),
-            source=str(payload["source"]),
-            target=str(payload["target"]),
-            texts=segments,
-            timeout=float(job["executor"].get("timeout_seconds") or 600),
-        )
-        if not isinstance(translated, list) or len(translated) != len(segments):
-            raise ExecutionError(
-                "output_validation_failed",
-                "LibreTranslate returned a batch with the wrong length",
-            )
-        if not all(isinstance(value, str) for value in translated):
-            raise ExecutionError(
-                "output_validation_failed",
-                "LibreTranslate batch contains a non-string translation",
-            )
+        request = {
+            "endpoint": environment.get("LIBRETRANSLATE_ENDPOINT", DEFAULT_ENDPOINT),
+            "request_format": environment.get("LIBRETRANSLATE_FORMAT", DEFAULT_FORMAT),
+            "source": str(payload["source"]),
+            "target": str(payload["target"]),
+            "texts": segments,
+            "timeout": float(job["executor"].get("timeout_seconds") or 600),
+        }
+
+        def validated(value: str | list[str]) -> list[str]:
+            if not isinstance(value, list) or len(value) != len(segments):
+                raise ExecutionError(
+                    "output_validation_failed",
+                    "LibreTranslate returned a batch with the wrong length",
+                )
+            if not all(isinstance(item, str) for item in value):
+                raise ExecutionError(
+                    "output_validation_failed",
+                    "LibreTranslate batch contains a non-string translation",
+                )
+            return value
+
+        translated = validated(_translate(**request))
+        bad = _first_degenerate_segment(segments, translated)
+        if bad is not None:
+            # One degenerate segment spoils the whole batch; re-request it
+            # once, then fail naming the first offending segment index.
+            translated = validated(_retranslate(request))
+            bad = _first_degenerate_segment(segments, translated)
+            if bad is not None:
+                index, reason = bad
+                raise ExecutionError(
+                    "degenerate_output",
+                    f"LibreTranslate segment {index} failed sanity check: {reason}",
+                )
 
         document = {
             "job_id": job["id"],

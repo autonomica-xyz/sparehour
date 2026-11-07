@@ -71,7 +71,7 @@ catalog. Bundled routes:
 | [llm-batch](workloads/llm-batch.yaml) | Qwen3.5 9B W4 / vLLM | Process ordered batches of text prompts |
 | [transcribe](workloads/transcribe.yaml) | Parakeet or WhisperX | Speech recognition, timestamps, English alignment, optional speaker diarization |
 | [translate-batch](workloads/translate-batch.yaml) | Argos / CTranslate2 | GPU text translation using reviewed language packs |
-| [translate-segment](workloads/translate-segment.yaml) and [translate-text-batch](workloads/translate-text-batch.yaml) | LibreTranslate | Single-segment and batched translation through a local service |
+| [translate-segment](workloads/translate-segment.yaml) and [translate-text-batch](workloads/translate-text-batch.yaml) | LibreTranslate | Single-segment and batched translation through a local service (GPU default route, optional CPU route) |
 
 Routes define the trusted executor, immutable model identity, hardware
 requirements, input schema, and output validation. Jobs supply data, not
@@ -84,7 +84,9 @@ the pinned snapshot's LFS/blob identities and writes per-file SHA-256
 manifests for offline verification at load time. See [model locks](models/),
 the [workload guide](workloads/README.md), and the [transcription](deploy/transcription/requirements.txt)
 and [vLLM](deploy/llm/requirements.txt) runtime profiles. Bundled ML routes
-target NVIDIA hardware. Model licenses apply separately; a fresh pyannote
+target NVIDIA hardware, except the `libretranslate-cpu` translate-segment
+route, which CPU-only workers serve with a float32 loopback service (see the
+[workload guide](workloads/README.md)). Model licenses apply separately; a fresh pyannote
 diarization-pack download requires approved Hugging Face access.
 
 ### Spark and architecture-specific placement

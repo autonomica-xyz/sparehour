@@ -98,3 +98,4 @@ retry:
     - gpu_oom
     - model_server_unavailable
     - model_server_error
+    - degenerate_output
